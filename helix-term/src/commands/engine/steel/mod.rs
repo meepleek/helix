@@ -1874,6 +1874,27 @@ impl super::PluginSystem for SteelScriptingEngine {
             }
         }
     }
+
+    fn function_exists(&self, ident: &str) -> bool {
+        enter_engine(|engine| {
+            if engine.global_exists(ident) {
+                if crate::commands::typed::TYPABLE_COMMAND_MAP.contains_key(ident) {
+                    let should_prefer_builtin = identifier_available_at_startup(ident);
+                    if should_prefer_builtin {
+                        return false;
+                    }
+                }
+
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    fn shutdown(&self) {
+        enter_engine(|engine| *engine = Engine::new_raw_no_kernel());
+    }
 }
 
 fn patch_callbacks(ctx: &mut Context<'_>) {
@@ -3635,14 +3656,11 @@ fn load_treesitter_api(engine: &mut Engine, generate_sources: bool) {
              lower: u32,
              upper: u32|
              -> Option<Vec<TreeSitterTree>> {
-                let Some(syn) = cx
+                let syn = cx
                     .editor
                     .documents
                     .get(&doc_id)
-                    .and_then(|d| d.syntax.as_ref())
-                else {
-                    return None;
-                };
+                    .and_then(|d| d.syntax.as_ref())?;
 
                 Some(TreeSitterSyntax::get_trees_byte_range(syn, lower, upper))
             },
@@ -3673,9 +3691,7 @@ fn load_treesitter_api(engine: &mut Engine, generate_sources: bool) {
              -> Option<Result<TreeSitterMatch, SteelErr>> {
                 let (text, syn) = {
                     let Some(doc) = cx.editor.documents.get(&doc_id) else {
-                        return Some(
-                            steelerr!(Generic => "unable to find doc, id: {}", doc_id).into(),
-                        );
+                        return Some(steelerr!(Generic => "unable to find doc, id: {}", doc_id));
                     };
                     let text = doc.text().slice(..);
                     let Some(syn) = doc.syntax() else {
@@ -3708,9 +3724,7 @@ fn load_treesitter_api(engine: &mut Engine, generate_sources: bool) {
              -> Option<Result<TreeSitterMatch, SteelErr>> {
                 let (text, syn) = {
                     let Some(doc) = cx.editor.documents.get(&doc_id) else {
-                        return Some(
-                            steelerr!(Generic => "unable to find doc, id: {}", doc_id).into(),
-                        );
+                        return Some(steelerr!(Generic => "unable to find doc, id: {}", doc_id));
                     };
                     let text = doc.text().slice(..);
                     let Some(syn) = doc.syntax() else {
@@ -3754,10 +3768,10 @@ fn load_treesitter_api(engine: &mut Engine, generate_sources: bool) {
          -> Result<TreeSitterQuery, SteelErr> {
             let loader = config.language_configuration.load();
             let Some(lang) = loader.language_for_name(language.to_string()) else {
-                return steelerr!(Generic => "unable to find language: {}", language).into();
+                return steelerr!(Generic => "unable to find language: {}", language);
             };
             let Some(config) = loader.get_config(lang) else {
-                return steelerr!(Generic => "unable to find language: {}", language).into();
+                return steelerr!(Generic => "unable to find language: {}", language);
             };
             TreeSitterQuery::new(config.grammar, source.as_str())
         },
@@ -3815,14 +3829,14 @@ fn load_treesitter_api(engine: &mut Engine, generate_sources: bool) {
              -> Result<TreeSitterSyntax, SteelErr> {
                 let loader = config.language_configuration.load();
                 let Some(lang) = loader.language_for_name(language.as_str()) else {
-                    return steelerr!(Generic => "unable to find language: {}", language).into();
+                    return steelerr!(Generic => "unable to find language: {}", language);
                 };
                 TreeSitterSyntax::new(source, lang, loader.as_ref())
             },
         );
 
     if generate_sources {
-        generate_module("treesitter.scm", &builtin_treesitter_module);
+        generate_module("treesitter.scm", builtin_treesitter_module);
         configure_lsp_builtins("treesitter", &module);
     }
     engine.register_steel_module(
@@ -3878,7 +3892,8 @@ fn load_misc_api(engine: &mut Engine, generate_sources: bool) {
         .register_fn_with_ctx(CTX, "await-callback", await_value)
         .register_fn_with_ctx(CTX, "add-inlay-hint", add_inlay_hint)
         .register_fn_with_ctx(CTX, "remove-inlay-hint", remove_inlay_hint)
-        .register_fn_with_ctx(CTX, "remove-inlay-hint-by-id", remove_inlay_hint_by_id);
+        .register_fn_with_ctx(CTX, "remove-inlay-hint-by-id", remove_inlay_hint_by_id)
+        .register_fn("fuzzy-match", fuzzy_match);
 
     if generate_sources {
         generate_module("misc.scm", &builtin_misc_module);
@@ -3911,7 +3926,7 @@ pub fn generate_cog_file() {
 pub fn load_ext_api(engine: &mut Engine, generate_sources: bool) {
     let ext_api = include_str!("ext.scm");
     if generate_sources {
-        generate_module("ext.scm", &ext_api);
+        generate_module("ext.scm", ext_api);
     }
     engine.register_steel_module("helix/ext.scm".to_string(), ext_api.to_string());
 }
@@ -4045,6 +4060,23 @@ fn acquire_context_lock(
     Ok(())
 }
 
+fn fuzzy_match(pattern: SteelString, items: SteelVal) -> Vec<SteelVal> {
+    if let SteelVal::ListV(l) = items {
+        let res = helix_core::fuzzy::fuzzy_match(
+            pattern.as_str(),
+            l.iter().filter_map(|x| x.as_string().map(|x| x.as_str())),
+            false,
+        );
+
+        return res
+            .into_iter()
+            .map(|x| x.0.to_string().into())
+            .collect::<Vec<SteelVal>>();
+    }
+
+    Vec::new()
+}
+
 fn configure_engine_impl(mut engine: Engine) -> Engine {
     log::info!("Loading engine!");
 
@@ -4130,22 +4162,7 @@ fn configure_engine_impl(mut engine: Engine) -> Engine {
         }
     });
 
-    engine.register_fn("fuzzy-match", |pattern: SteelString, items: SteelVal| {
-        if let SteelVal::ListV(l) = items {
-            let res = helix_core::fuzzy::fuzzy_match(
-                pattern.as_str(),
-                l.iter().filter_map(|x| x.as_string().map(|x| x.as_str())),
-                false,
-            );
-
-            return res
-                .into_iter()
-                .map(|x| x.0.to_string().into())
-                .collect::<Vec<SteelVal>>();
-        }
-
-        Vec::new()
-    });
+    engine.register_fn("fuzzy-match", fuzzy_match);
 
     // Find the workspace
     engine.register_fn("helix-find-workspace", || {
